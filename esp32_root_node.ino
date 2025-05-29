@@ -1,117 +1,226 @@
-#include <painlessMesh.h>
 #include <WiFi.h>
-#include <PubSubClient.h>
+#include <PubSubClient.h>   // Library untuk MQTT
+#include <ArduinoJson.h>    // Library untuk JSON (mengirim/menerima data terstruktur)
+#include <painlessMesh.h>   // Library untuk Mesh Networking
 
-// === WiFi dan MQTT Config ===
-const char* ssid = ""; // Ganti dengan SSID WiFi Anda
-const char* password = ""; // Ganti dengan password WiFi Anda
+// --- KONFIGURASI WIFI (Untuk Gateway terhubung ke Router) ---
+// Ganti dengan NAMA WIFI dan PASSWORD Anda!
+const char* ssid = "RESTU";
+const char* password = "restu547";
 
-const char* mqtt_server = "broker.hivemq.com";
-const int mqtt_port = 1883;
+// --- KONFIGURASI MQTT (Untuk Gateway terhubung ke HiveMQ Cloud) ---
+// HOSTNAME dari HiveMQ Cloud Anda. Temukan ini di HiveMQ Cloud Dashboard > Cluster Details.
+// Contoh: "f6edeb4adb7c402ca7291dd7ef4d8fc5.s1.eu.hivemq.cloud"
+const char* mqtt_broker = "90c69dacebc2450495a401b6550d787b.s1.eu.hivemq.cloud"; // <-- GANTI DENGAN HOSTNAME ASLI ANDA!
+const int mqtt_port = 8883; // Port SSL/TLS untuk HiveMQ Cloud
+// Username dan Password MQTT yang Anda buat di HiveMQ Cloud untuk 'smarthome_iot_devices'
+const char* mqtt_user = "smarthome_iot_devices";         // <-- GANTI DENGAN USERNAME ASLI ANDA!
+const char* mqtt_password = "Smarthome99"; // <-- GANTI DENGAN PASSWORD ASLI ANDA!
+const char* mqtt_client_id = "ESP32_Gateway_001";       // ID klien unik untuk Gateway ini. Harus unik di antara semua klien MQTT.
 
-// --- PERBAIKAN PENTING DI SINI ---
-// mqtt_topic_sub di root node (apa yang root node dengarkan dari MQTT broker)
-// HARUS SAMA dengan mqtt_topic_pub di Flask (apa yang Flask kirimkan sebagai perintah kontrol)
-const char* mqtt_topic_sub = "rumah/control"; // ROOT NODE MENDENGARKAN PERINTAH DARI FLASK
+// --- KONFIGURASI TOPIK MQTT (sesuai dengan permissions di HiveMQ Cloud) ---
+// Topik untuk Gateway mempublikasikan data sensor yang diterima dari Mesh ke Cloud
+const char* mqtt_topic_publish_sensor = "starswechase/sungai/mesh_sensor_data";
+// Topik untuk Gateway berlangganan perintah kontrol dari Cloud
+const char* mqtt_topic_subscribe_control = "starswechase/sungai/control/#"; // Menggunakan '#' untuk semua sub-topik kontrol
 
-// mqtt_topic_pub di root node (apa yang root node kirimkan ke MQTT broker)
-// HARUS SAMA dengan mqtt_topic_sub di Flask (apa yang Flask dengarkan sebagai data sensor)
-const char* mqtt_topic_pub = "rumah/status"; // ROOT NODE MENGIRIM DATA SENSOR KE FLASK
-// --- AKHIR PERBAIKAN PENTING ---
+// --- KONFIGURASI MESH (painlessMesh) ---
+// Ganti dengan NAMA JARINGAN Mesh dan PASSWORD Mesh Anda!
+// Ini harus sama di semua node Mesh Anda.
+#define   MESH_PREFIX     "SmartHomeMesh"
+#define   MESH_PASSWORD   "mesh_jarkom_123"
+#define   MESH_PORT       5555 // Port untuk komunikasi Mesh
 
-// === Mesh Config ===
-#define MESH_PREFIX "SmartHomeMesh"
-#define MESH_PASSWORD "meshpassword"
-#define MESH_PORT 5555
+painlessMesh  mesh; // Objek painlessMesh
 
-Scheduler userScheduler;
-painlessMesh mesh;
+// --- PIN UNTUK AKTUATOR (Contoh: LED built-in ESP32) ---
+// Sesuaikan dengan pin GPIO yang Anda gunakan untuk lampu atau aktuator lain.
+const int LED_PIN = 2; // Pin GPIO untuk lampu LED (biasanya LED internal ESP32)
 
+// Inisialisasi klien Wi-Fi dan MQTT
 WiFiClient espClient;
 PubSubClient client(espClient);
 
-// MQTT reconnect
-void reconnect() {
+// Variabel untuk melacak waktu pengiriman data (contoh jika Gateway juga punya sensor, atau untuk keep-alive)
+unsigned long lastPublishMillis = 0;
+const long publishInterval = 30000; // Kirim pesan setiap 30 detik (contoh)
+
+// --- MESH CALLBACKS ---
+// Dipanggil saat Gateway menerima pesan dari node Mesh lain
+void receivedCallback( uint32_t from, String &msg ) {
+  Serial.printf("Gateway received from Mesh node %u: %s\n", from, msg.c_str());
+
+  // ASUMSI: 'msg' adalah data sensor dari node Mesh dalam format JSON atau string sederhana.
+  // Anda akan meneruskan pesan ini ke HiveMQ Cloud melalui MQTT.
+  // Jika 'msg' perlu diproses (misal, ditambah timestamp), lakukan di sini.
+  Serial.print("Publishing Mesh data to MQTT Cloud on topic: ");
+  Serial.println(mqtt_topic_publish_sensor);
+  client.publish(mqtt_topic_publish_sensor, msg.c_str());
+}
+
+// Dipanggil saat ada koneksi baru ke Mesh
+void newConnectionCallback(uint32_t nodeId) {
+    Serial.printf("New connection from Mesh node %u\n", nodeId);
+}
+
+// Dipanggil saat koneksi Mesh berubah (node bergabung/meninggalkan)
+void changedConnectionsCallback() {
+    Serial.printf("Changed connections. Total nodes: %d\n", mesh.getNodeList().size());
+}
+
+// Dipanggil saat Mesh menemukan node baru dan menyesuaikan waktu
+void nodeTimeAdjustedCallback(int32_t offset) {
+    Serial.printf("Adjusted time %u. Offset = %d\n", mesh.getNodeTime(), offset);
+}
+
+// --- MQTT CALLBACK ---
+// Dipanggil saat pesan MQTT diterima dari HiveMQ Cloud
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  Serial.print("Message arrived from Cloud on topic: ");
+  Serial.println(topic);
+  Serial.print("Payload: ");
+  String messageTemp;
+  for (int i = 0; i < length; i++) {
+    Serial.print((char)payload[i]);
+    messageTemp += (char)payload[i];
+  }
+  Serial.println();
+
+  // --- LOGIKA KONTROL AKTUATOR LOKAL ATAU PENERUSAN PERINTAH KE MESH ---
+  // Jika pesan diterima di topik kontrol lampu
+  if (String(topic) == "starswechase/sungai/control/lampu") {
+    Serial.print("Control message for Lamp: ");
+    if (messageTemp == "ON") {
+      digitalWrite(LED_PIN, HIGH); // Nyalakan LED (simulasi lampu di Gateway)
+      Serial.println("LED ON");
+      // Jika lampu adalah node Mesh terpisah, Anda akan meneruskan perintah ini ke Mesh
+      // mesh.sendSingle(NODE_ID_LAMP_MESH, "ON"); // Ganti NODE_ID_LAMP_MESH dengan ID node lampu Anda
+      // Atau broadcast ke semua node Mesh jika semua node memproses pesan kontrol:
+      // mesh.sendBroadcast("{\"device\":\"lampu\",\"command\":\"ON\"}");
+    } else if (messageTemp == "OFF") {
+      digitalWrite(LED_PIN, LOW); // Matikan LED
+      Serial.println("LED OFF");
+      // Contoh: mesh.sendSingle(NODE_ID_LAMP_MESH, "OFF");
+      // Atau broadcast:
+      // mesh.sendBroadcast("{\"device\":\"lampu\",\"command\":\"OFF\"}");
+    }
+  }
+  // Jika pesan diterima di topik kontrol kipas
+  else if (String(topic) == "starswechase/sungai/control/kipas") {
+    Serial.print("Control message for Fan: ");
+    Serial.println(messageTemp);
+    // Tambahkan logika kontrol kipas di sini, atau teruskan ke node Mesh yang mengontrol kipas
+    // Contoh: mesh.sendSingle(NODE_ID_FAN_MESH, messageTemp);
+    // Atau broadcast:
+    // mesh.sendBroadcast("{\"device\":\"kipas\",\"command\":\"" + messageTemp + "\"}");
+  }
+  // Anda bisa menambahkan lebih banyak kondisi 'else if' untuk topik kontrol lainnya
+}
+
+// --- FUNGSI KONEKSI WIFI ---
+void setup_wifi() {
+  delay(10);
+  Serial.println();
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(ssid);
+
+  WiFi.begin(ssid, password);
+
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    retries++;
+    if(retries > 20){ // Coba 20 kali (10 detik), lalu restart ESP32
+        Serial.println("\nFailed to connect to WiFi. Restarting ESP32...");
+        ESP.restart();
+    }
+  }
+
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+}
+
+// --- FUNGSI REKONEKSI MQTT ---
+void reconnect_mqtt() {
+  // Loop sampai terhubung ke MQTT
   while (!client.connected()) {
-    Serial.print("Menghubungkan ke MQTT...");
-    // Ganti "ESP32RootNode" dengan ID unik jika Anda memiliki beberapa root node
-    if (client.connect("ESP32RootNode")) { 
-      Serial.println("Terhubung!");
-      // Setelah terhubung, berlangganan ke topik kontrol dari Flask
-      client.subscribe(mqtt_topic_sub); 
-      Serial.printf("Berlangganan ke topik MQTT: %s\n", mqtt_topic_sub);
+    Serial.print("Attempting MQTT connection...");
+    // client.setInsecure() memungkinkan koneksi TLS tanpa validasi sertifikat.
+    // Ini bagus untuk development/testing, tapi TIDAK aman untuk produksi.
+    // UNTUK PRODUKSI, Anda perlu set sertifikat CA (Certificate Authority) Root.
+    client.setInsecure(); // HANYA UNTUK PENGEMBANGAN!
+    // Contoh untuk produksi: client.setCACert(ISRG_ROOT_X1_CA_CERT); (ISRG_ROOT_X1_CA_CERT adalah string sertifikat)
+
+    if (client.connect(mqtt_client_id, mqtt_user, mqtt_password)) {
+      Serial.println("MQTT Connected!");
+      // Subscribe ke topik kontrol setelah berhasil terhubung
+      client.subscribe(mqtt_topic_subscribe_control);
+      Serial.print("Subscribed to MQTT topic: ");
+      Serial.println(mqtt_topic_subscribe_control);
     } else {
-      Serial.print("Gagal, rc=");
+      Serial.print("MQTT connection failed, rc=");
       Serial.print(client.state());
-      Serial.println(" coba lagi dalam 2 detik");
-      delay(2000);
+      Serial.println(". Retrying in 5 seconds...");
+      delay(5000); // Tunggu 5 detik sebelum mencoba lagi
     }
   }
 }
 
-// Kirim data ke HiveMQ
-void publishToMQTT(String payload) {
-  // Pastikan klien MQTT terhubung sebelum mencoba memublikasikan
-  if (client.connected()) {
-    client.publish(mqtt_topic_pub, payload.c_str());
-    Serial.println("Dikirim ke MQTT: " + payload);
-  } else {
-    Serial.println("Klien MQTT tidak terhubung, tidak dapat memublikasikan.");
-  }
-}
-
-// Terima pesan dari MQTT (ON/OFF)
-void callback(char* topic, byte* payload, unsigned int length) {
-  String msg = "";
-  for (unsigned int i = 0; i < length; i++) {
-    msg += (char)payload[i];
-  }
-
-  Serial.printf("Pesan dari MQTT (topik: %s): %s\n", topic, msg.c_str());
-  mesh.sendBroadcast(msg);  // teruskan ke node lewat mesh
-  Serial.println("Pesan MQTT diteruskan ke Mesh.");
-}
-
-// Terima dari node mesh
-void receivedCallback(uint32_t from, String &msg) {
-  Serial.printf("Pesan dari node %u di Mesh: %s\n", from, msg.c_str());
-  publishToMQTT(msg); // Publikasikan data dari mesh ke MQTT broker
-}
-
+// --- SETUP UTAMA (Jalankan sekali saat ESP32 pertama kali menyala) ---
 void setup() {
-  Serial.begin(115200);
-  delay(100); // Sedikit delay untuk inisialisasi Serial
+  Serial.begin(115200); // Inisialisasi Serial Monitor
+  pinMode(LED_PIN, OUTPUT); // Inisialisasi pin untuk LED (simulasi lampu)
 
-  Serial.println("\nMemulai Root Node ESP32...");
+  // 1. Setup WiFi (untuk koneksi ke internet / HiveMQ Cloud)
+  setup_wifi();
 
-  // Wi-Fi
-  Serial.printf("Menghubungkan ke WiFi: %s\n", ssid);
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(1000);
-    Serial.print(".");
-  }
-  Serial.println("\nWiFi terhubung! IP Address: ");
-  Serial.println(WiFi.localIP());
+  // 2. Setup MQTT Client
+  client.setServer(mqtt_broker, mqtt_port);
+  client.setCallback(mqttCallback); // Set fungsi callback untuk pesan MQTT masuk dari Cloud
 
-  // MQTT
-  client.setServer(mqtt_server, mqtt_port);
-  client.setCallback(callback); // Mengatur fungsi untuk menangani pesan MQTT yang masuk
+  // 3. Setup painlessMesh
+  // mesh.setDebugMsgLevel( (MeshDebug)LOG_ERROR ); // Hanya tampilkan error untuk debugging Mesh
+  mesh.init( MESH_PREFIX, MESH_PASSWORD, MESH_PORT );
+  mesh.onReceive(&receivedCallback);          // Callback saat pesan diterima dari Mesh
+  mesh.onNewConnection(&newConnectionCallback); // Callback saat ada node baru terhubung ke Mesh
+  mesh.onChangedConnections(&changedConnectionsCallback); // Callback saat koneksi Mesh berubah
+  mesh.onNodeTimeAdjusted(&nodeTimeAdjustedCallback); // Callback saat waktu node disesuaikan di Mesh
 
-  // Mesh
-  Serial.println("Memulai PainlessMesh...");
-  mesh.setDebugMsgTypes(ERROR | STARTUP | CONNECTION); // Debug level
-  mesh.init(MESH_PREFIX, MESH_PASSWORD, &userScheduler, MESH_PORT);
-  mesh.onReceive(&receivedCallback); // Mengatur fungsi untuk menangani pesan dari node mesh
-  Serial.println("PainlessMesh diinisialisasi.");
+  // Menentukan Gateway adalah node yang terhubung ke WiFi (Internet).
+  // Ini penting agar painlessMesh tahu siapa yang bertanggung jawab untuk koneksi luar.
+  mesh.setContainsRoot(true);
 }
 
+// --- LOOP UTAMA (Jalankan terus menerus setelah setup) ---
 void loop() {
-  mesh.update(); // Update mesh network state
+  // Penting: Panggil mesh.update() di awal loop untuk menjaga jaringan Mesh
+  mesh.update();
 
-  // Pastikan klien MQTT terhubung
+  // Pastikan koneksi MQTT ke Cloud tetap aktif
   if (!client.connected()) {
-    reconnect();
+    reconnect_mqtt(); // Jika tidak terhubung, coba hubungkan kembali
   }
-  client.loop(); // Memproses pesan masuk dan keluar untuk MQTT
+  client.loop(); // Memproses pesan masuk MQTT dan menjaga koneksi
+
+  // --- Bagian ini opsional jika Gateway hanya meneruskan data dari Mesh ---
+  // Jika Gateway ini juga memiliki sensor sendiri dan perlu mempublikasikan data secara berkala,
+  // atau hanya untuk mengirim pesan keep-alive ke Cloud secara berkala.
+  // unsigned long currentMillis = millis();
+  // if (currentMillis - lastPublishMillis > publishInterval) {
+  //   lastPublishMillis = currentMillis;
+  //
+  //   // Contoh publikasi data dari Gateway itu sendiri (jika ada sensor di Gateway)
+  //   // StaticJsonDocument<200> doc;
+  //   // doc["gateway_temp"] = 28.5; // Contoh data
+  //   // doc["gateway_humidity"] = 70.0;
+  //   // char jsonBuffer[200];
+  //   // serializeJson(doc, jsonBuffer);
+  //   //
+  //   // Serial.print("Publishing Gateway data to: ");
+  //   // Serial.println(mqtt_topic_publish_sensor);
+  //   // client.publish(mqtt_topic_publish_sensor, jsonBuffer);
+  // }
 }

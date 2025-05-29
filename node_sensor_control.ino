@@ -1,135 +1,146 @@
-#include <painlessMesh.h>
-#include <Wire.h>      // Untuk sensor BH1750
-#include <BH1750.h>    // Untuk sensor cahaya
-#include <DHT.h>       // Untuk sensor suhu/kelembaban
-#include <ArduinoJson.h> // Untuk parsing dan serialisasi JSON
+#include <ESP8266WiFi.h> // Library WiFi untuk ESP8266
+#include <painlessMesh.h>   // Library untuk Mesh Networking
+#include <ArduinoJson.h>    // Library untuk JSON
+#include <DHT.h>            // Library untuk sensor DHT (jika Anda pakai DHT11/DHT22)
+#include <Adafruit_Sensor.h> // Library dasar untuk sensor Adafruit (diperlukan DHT library)
 
-// Mesh config (harus sama dengan root node dan node lainnya)
-#define   MESH_PREFIX     "SmartHomeMesh"
-#define   MESH_PASSWORD   "meshpassword"
-#define   MESH_PORT       5555
+// --- KONFIGURASI MESH (painlessMesh) ---
+// HARUS SAMA PERSIS dengan konfigurasi di ESP32 Gateway Anda!
+#define   MESH_PREFIX     "SmartHomeMesh"     // Nama Jaringan Mesh Anda
+#define   MESH_PASSWORD   "mesh_jarkom_123"   // Kata Sandi Jaringan Mesh Anda
+#define   MESH_PORT       5555                // Port untuk komunikasi Mesh
 
-// --- DEFINISI PIN UNTUK KEDUA PERANGKAT ---
-#define LED_PIN 2       // <--- GANTI DENGAN PIN GPIO YANG TERHUBUNG KE LED/RELAY LAMPU ANDA
-#define DHTPIN 4        // <--- GANTI DENGAN PIN GPIO YANG BENAR UNTUK DHT11 ANDA
-#define DHTTYPE DHT11
-#define MOTOR_PIN 15    // <--- GANTI DENGAN PIN GPIO YANG TERHUBUNG KE DRIVER MOTOR KIPAS ANDA
+painlessMesh  mesh; // Objek painlessMesh
 
-// Deklarasi objek sensor
-BH1750 lightMeter;
-DHT dht(DHTPIN, DHTTYPE);
+// --- KONFIGURASI SENSOR (Contoh DHT11/DHT22) ---
+// Ganti dengan pin GPIO yang DATA pin DHT Anda terhubung di NodeMCU.
+// Perhatikan: Pin D2 pada NodeMCU adalah GPIO4. Sesuaikan jika Anda pakai pin lain.
+#define DHTPIN D2          // Pin GPIO tempat DATA pin DHT terhubung (contoh GPIO4)
+#define DHTTYPE DHT11      // Ganti DHT11 atau DHT22 sesuai sensor Anda
+DHT dht(DHTPIN, DHTTYPE);  // Inisialisasi sensor DHT
 
-Scheduler userScheduler;
-painlessMesh mesh;
+// --- PIN UNTUK AKTUATOR (Contoh: LED eksternal atau Relay untuk Lampu) ---
+// Ganti dengan pin GPIO yang terhubung ke lampu atau aktuator lain di NodeMCU.
+// Pin D1 pada NodeMCU adalah GPIO5. Sesuaikan jika Anda pakai pin lain.
+const int LAMP_PIN = D1; // Pin GPIO untuk lampu yang dikontrol oleh NodeMCU ini (misalnya D1/GPIO5)
+// const int FAN_PIN = DX; // Contoh: Pin untuk kipas, jika ada
 
-// Nama node ini, akan muncul di payload JSON
-String nodeName = "sensor_control_node";
+// Variabel untuk melacak waktu pengiriman data sensor
+unsigned long lastSensorReadMillis = 0;
+const long sensorReadInterval = 15000; // Baca dan kirim data sensor setiap 15 detik
 
-// --- PROTOTIPE FUNGSI ---
-// Deklarasikan fungsi di sini agar kompilator tahu mereka ada
-void sendAllSensorData();
-void receivedCallback(uint32_t from, String &msg);
+// --- MESH CALLBACKS ---
+// Dipanggil saat NodeMCU ini menerima pesan dari node Mesh lain (termasuk Gateway)
+void receivedCallback( uint32_t from, String &msg ) {
+  Serial.printf("NodeMCU received from Mesh node %u: %s\n", from, msg.c_str());
 
-// Deklarasi Task global untuk pengiriman data sensor (setiap 5 detik)
-Task allSensorDataTask(5000, TASK_FOREVER, &sendAllSensorData);
-
-// Fungsi untuk membaca semua sensor dan mengirim data gabungan ke root
-void sendAllSensorData() {
-  float lux = lightMeter.readLightLevel();
-  float h = dht.readHumidity();
-  float t = dht.readTemperature();
-
-  // Penanganan pembacaan sensor yang gagal
-  if (isnan(h) || isnan(t)) {
-    Serial.println("Gagal membaca dari sensor DHT");
-    // Anda mungkin ingin mengirim nilai default atau null jika gagal
-    h = -1.0; // Contoh: kirim -1 sebagai indikasi gagal
-    t = -1.0;
-  }
-  if (lux < 0) { // BH1750 mengembalikan -1 jika gagal membaca
-    Serial.println("Gagal membaca dari sensor BH1750");
-    lux = -1.0; // Contoh: kirim -1 sebagai indikasi gagal
-  }
-
-  // Buat payload JSON gabungan
-  String msg = "{";
-  msg += "\"node\":\"" + nodeName + "\",";
-  msg += "\"lux\":" + String(lux, 2) + ",";
-  msg += "\"temperature\":" + String(t, 1) + ",";
-  msg += "\"humidity\":" + String(h, 1);
-  msg += "}";
-
-  mesh.sendBroadcast(msg);
-  Serial.println("Terkirim: " + msg);
-}
-
-// Fungsi untuk menerima pesan kontrol dari root node (melalui mesh)
-void receivedCallback(uint32_t from, String &msg) {
-  Serial.printf("Pesan dari %u: %s\n", from, msg.c_str());
-
-  DynamicJsonDocument doc(256); // Ukuran disesuaikan dengan payload kontrol
+  // ASUMSI: 'msg' adalah perintah kontrol dari Gateway (yang berasal dari Flask via MQTT).
+  // Misalnya: "{\"device\":\"lampu\",\"command\":\"ON\"}"
+  StaticJsonDocument<200> doc;
   DeserializationError error = deserializeJson(doc, msg);
 
   if (error) {
-    Serial.print("deserializeJson() failed: ");
-    Serial.println(error.c_str());
+    Serial.print(F("deserializeJson() failed: "));
+    Serial.println(error.f_str());
     return;
   }
 
-  String device = doc["device"]; // Ambil nama perangkat (misal: "lampu" atau "kipas")
-  String state = doc["state"];   // Ambil status (misal: "ON" atau "OFF")
+  String device = doc["device"].as<String>();
+  String command = doc["command"].as<String>();
 
-  // Logika kontrol untuk lampu
+  Serial.printf("Parsed command: Device=%s, Command=%s\n", device.c_str(), command.c_str());
+
+  // --- LOGIKA KONTROL AKTUATOR LOKAL DI NODEMCU INI ---
   if (device == "lampu") {
-    if (state == "ON") {
-      digitalWrite(LED_PIN, HIGH);
-      Serial.println("LAMPU DINYALAKAN");
-    } else if (state == "OFF") {
-      digitalWrite(LED_PIN, LOW);
-      Serial.println("LAMPU DIMATIKAN");
+    if (command == "ON") {
+      digitalWrite(LAMP_PIN, HIGH);
+      Serial.println("Lamp ON (controlled by this NodeMCU)");
+    } else if (command == "OFF") {
+      digitalWrite(LAMP_PIN, LOW);
+      Serial.println("Lamp OFF (controlled by this NodeMCU)");
     }
   }
-  // Logika kontrol untuk kipas
+  // Tambahkan logika untuk kipas, dll. jika ada
   else if (device == "kipas") {
-    if (state == "ON") {
-      digitalWrite(MOTOR_PIN, HIGH);
-      Serial.println("KIPAS DINYALAKAN");
-    } else if (state == "OFF") {
-      digitalWrite(MOTOR_PIN, LOW);
-      Serial.println("KIPAS DIMATIKAN");
-    }
+    Serial.print("Control message for Fan: ");
+    Serial.println(command);
+    // if (command == "HIGH") { ... }
+    // else if (command == "OFF") { ... }
   }
 }
 
-void setup() {
-  Serial.begin(115200);
+// Dipanggil saat NodeMCU ini berhasil terhubung ke jaringan Mesh
+void newConnectionCallback(uint32_t nodeId) {
+    Serial.printf("New connection in Mesh: %u\n", nodeId);
+}
 
-  // Inisialisasi sensor BH1750 (I2C)
-  // Pastikan pin SDA/SCL ini benar untuk ESP32 Anda
-  Wire.begin(21, 22);
-  lightMeter.begin();
+// Dipanggil saat koneksi Mesh berubah (node bergabung/meninggalkan)
+void changedConnectionsCallback() {
+    Serial.printf("Changed connections. Total nodes: %d\n", mesh.getNodeList().size());
+}
+
+// Dipanggil saat Mesh menemukan node baru dan menyesuaikan waktu
+void nodeTimeAdjustedCallback(int32_t offset) {
+    Serial.printf("Adjusted time %u. Offset = %d\n", mesh.getNodeTime(), offset);
+}
+
+// --- SETUP UTAMA (Jalankan sekali saat NodeMCU pertama kali menyala) ---
+void setup() {
+  Serial.begin(115200); // Inisialisasi Serial Monitor
+  pinMode(LAMP_PIN, OUTPUT); // Inisialisasi pin untuk lampu
 
   // Inisialisasi sensor DHT
   dht.begin();
+  Serial.println("DHT sensor initialized.");
 
-  // Inisialisasi pin aktuator (LED untuk lampu, MOTOR_PIN untuk kipas)
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW); // Pastikan lampu mati di awal
+  // 1. Setup painlessMesh
+  // mesh.setDebugMsgLevel( (MeshDebug)LOG_ERROR ); // Hanya tampilkan error untuk debugging Mesh
+  mesh.init( MESH_PREFIX, MESH_PASSWORD, MESH_PORT );
+  mesh.onReceive(&receivedCallback);          // Callback saat pesan diterima dari Mesh
+  mesh.onNewConnection(&newConnectionCallback); // Callback saat ada node baru terhubung
+  mesh.onChangedConnections(&changedConnectionsCallback); // Callback saat koneksi berubah
+  mesh.onNodeTimeAdjusted(&nodeTimeAdjustedCallback); // Callback saat waktu node disesuaikan
 
-  pinMode(MOTOR_PIN, OUTPUT);
-  digitalWrite(MOTOR_PIN, LOW); // Pastikan kipas mati di awal
-
-  // Inisialisasi mesh
-  mesh.setDebugMsgTypes(ERROR | STARTUP | CONNECTION);
-  mesh.init(MESH_PREFIX, MESH_PASSWORD, &userScheduler, MESH_PORT);
-  mesh.onReceive(&receivedCallback);
-  
-  // Tambahkan task untuk mengirim data gabungan setiap 5 detik
-  userScheduler.addTask(allSensorDataTask);
-  allSensorDataTask.enable();
-  sendAllSensorData(); // Kirim data langsung pertama kali saat startup
+  // Node sensor ini BUKAN root, jadi JANGAN panggil mesh.setContainsRoot(true);
 }
 
+// --- LOOP UTAMA (Jalankan terus menerus setelah setup) ---
 void loop() {
+  // Penting: Panggil mesh.update() di awal loop untuk menjaga jaringan Mesh
   mesh.update();
+
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastSensorReadMillis > sensorReadInterval) {
+    lastSensorReadMillis = currentMillis;
+
+    // --- BACA DATA SENSOR ---
+    float h = dht.readHumidity();
+    float t = dht.readTemperature();
+
+    // Periksa apakah pembacaan gagal
+    if (isnan(h) || isnan(t)) {
+      Serial.println("Failed to read from DHT sensor!");
+      // Jangan kirim data jika pembacaan gagal
+      return;
+    }
+
+    // --- BUAT PAYLOAD JSON UNTUK DATA SENSOR ---
+    StaticJsonDocument<200> doc; // Ukuran dokumen JSON, sesuaikan jika perlu
+    doc["temperature"] = t;
+    doc["humidity"] = h;
+    doc["device_id"] = mesh.getNodeId(); // Kirim ID NodeMesh ini
+    doc["type"] = "sensor_data"; // Tambahkan tipe data agar Gateway bisa membedakan
+
+    char jsonBuffer[200];
+    serializeJson(doc, jsonBuffer); // Serialize JSON ke string
+
+    Serial.print("Publishing sensor data to Mesh: ");
+    Serial.println(jsonBuffer);
+
+    // --- PUBLIKASIKAN PESAN SENSOR KE MESH (ke Gateway) ---
+    // Karena Gateway adalah root, dan kita ingin semua data sensor ke sana,
+    // kita bisa menggunakan sendBroadcast dan Gateway akan menerimanya di receivedCallback-nya.
+    // Atau jika Anda tahu ID Gateway, bisa pakai mesh.sendSingle(GATEWAY_NODE_ID, jsonBuffer);
+    mesh.sendBroadcast(jsonBuffer);
+  }
 }
