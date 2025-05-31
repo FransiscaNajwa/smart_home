@@ -8,7 +8,7 @@
 
 // --- KONFIGURASI ROLE PERANGKAT ---
 // Uncomment baris berikut untuk mengatur perangkat sebagai Gateway saat mengunggah kode
-//#define GATEWAY
+#define GATEWAY
 
 // --- KONFIGURASI WIFI (Untuk Gateway terhubung ke Router) ---
 #ifdef GATEWAY
@@ -18,17 +18,17 @@ const char* password = "restu547";
 
 // --- KONFIGURASI MQTT (Untuk Gateway terhubung ke HiveMQ Cloud) ---
 #ifdef GATEWAY
-const char* mqtt_broker = "90c69dacebc2450495a401b6550d787b.s1.eu.hivemq.cloud"; // GANTI DENGAN HOSTNAME ASLI ANDA!
+const char* mqtt_broker = "6f820295b0364ee293a9a96c1f2457a6.s1.eu.hivemq.cloud"; // Hostname HiveMQ Cloud
 const int mqtt_port = 8883; // Port SSL/TLS
-const char* mqtt_user = "smarthome_iot_devices";         // GANTI DENGAN USERNAME ASLI ANDA!
-const char* mqtt_password = "Smarthome99";              // GANTI DENGAN PASSWORD ASLI ANDA!
-const char* mqtt_client_id = "ESP32_Gateway_001";       // ID klien unik untuk Gateway
+const char* mqtt_user = "hivemq.webclient.1748687406394";         // Username
+const char* mqtt_password = "K0p.D,9ErwiU!W51kS&n";              // Password
+const char* mqtt_client_id = "ESP32_Gateway_001";       // ID klien unik
 #endif
 
 // --- KONFIGURASI TOPIK MQTT ---
 #ifdef GATEWAY
-const char* mqtt_topic_publish_sensor = "starswechase/sungai/mesh_sensor_data";
-const char* mqtt_topic_subscribe_control = "starswechase/sungai/control/#"; // Menggunakan '#' untuk semua sub-topik
+const char* mqtt_topic_publish_sensor = "starswechase/sungai/data";
+const char* mqtt_topic_subscribe_control = "starswechase/sungai/control/#"; // Wildcard untuk semua sub-topik
 #endif
 
 // --- KONFIGURASI MESH (painlessMesh) ---
@@ -61,8 +61,8 @@ PubSubClient client(espClient);
 // Variabel untuk Task dan interval
 Scheduler userScheduler;
 unsigned long lastPublishMillis = 0;
-const long publishInterval = 30000; // 30 detik untuk Gateway (opsional)
-Task allSensorDataTask(5000, TASK_FOREVER, &sendAllSensorData); // 5 detik untuk Node
+const long publishInterval = 30000; // 30 detik untuk Gateway
+Task allSensorDataTask(10000, TASK_FOREVER, &sendAllSensorData); // 10 detik untuk Node
 
 // --- MESH CALLBACKS ---
 void receivedCallback(uint32_t from, String &msg) {
@@ -70,9 +70,13 @@ void receivedCallback(uint32_t from, String &msg) {
 
   #ifdef GATEWAY
     // Gateway meneruskan pesan ke HiveMQ Cloud
-    Serial.print("Publishing Mesh data to MQTT Cloud on topic: ");
-    Serial.println(mqtt_topic_publish_sensor);
-    client.publish(mqtt_topic_publish_sensor, msg.c_str());
+    if (client.connected()) {
+      Serial.print("Publishing Mesh data to MQTT Cloud on topic: ");
+      Serial.println(mqtt_topic_publish_sensor);
+      client.publish(mqtt_topic_publish_sensor, msg.c_str());
+    } else {
+      Serial.println("MQTT not connected, data not published.");
+    }
   #else
     // Node memproses pesan kontrol dari Gateway
     DynamicJsonDocument doc(256);
@@ -87,21 +91,11 @@ void receivedCallback(uint32_t from, String &msg) {
     String state = doc["state"];
 
     if (device == "lampu") {
-      if (state == "ON") {
-        digitalWrite(LED_PIN, HIGH);
-        Serial.println("LAMPU DINYALAKAN");
-      } else if (state == "OFF") {
-        digitalWrite(LED_PIN, LOW);
-        Serial.println("LAMPU DIMATIKAN");
-      }
+      digitalWrite(LED_PIN, state == "ON" ? HIGH : LOW);
+      Serial.println(state == "ON" ? "LAMPU DINYALAKAN" : "LAMPU DIMATIKAN");
     } else if (device == "kipas") {
-      if (state == "ON") {
-        digitalWrite(MOTOR_PIN, HIGH);
-        Serial.println("KIPAS DINYALAKAN");
-      } else if (state == "OFF") {
-        digitalWrite(MOTOR_PIN, LOW);
-        Serial.println("KIPAS DIMATIKAN");
-      }
+      digitalWrite(MOTOR_PIN, state == "ON" ? HIGH : LOW);
+      Serial.println(state == "ON" ? "KIPAS DINYALAKAN" : "KIPAS DIMATIKAN");
     }
   #endif
 }
@@ -121,30 +115,22 @@ void nodeTimeAdjustedCallback(int32_t offset) {
 // --- MQTT CALLBACK (Hanya untuk Gateway) ---
 #ifdef GATEWAY
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  Serial.print("Message arrived from Cloud on topic: ");
-  Serial.println(topic);
+  String topicStr = topic;
   String messageTemp;
   for (int i = 0; i < length; i++) {
     messageTemp += (char)payload[i];
   }
+  Serial.print("Message arrived on topic: ");
+  Serial.println(topicStr);
   Serial.print("Payload: ");
   Serial.println(messageTemp);
 
-  if (String(topic) == "starswechase/sungai/control/lampu") {
-    if (messageTemp == "ON") {
-      mesh.sendBroadcast("{\"device\":\"lampu\",\"state\":\"ON\"}");
-      Serial.println("LED ON command broadcasted");
-    } else if (messageTemp == "OFF") {
-      mesh.sendBroadcast("{\"device\":\"lampu\",\"state\":\"OFF\"}");
-      Serial.println("LED OFF command broadcasted");
-    }
-  } else if (String(topic) == "starswechase/sungai/control/kipas") {
-    if (messageTemp == "ON") {
-      mesh.sendBroadcast("{\"device\":\"kipas\",\"state\":\"ON\"}");
-      Serial.println("FAN ON command broadcasted");
-    } else if (messageTemp == "OFF") {
-      mesh.sendBroadcast("{\"device\":\"kipas\",\"state\":\"OFF\"}");
-      Serial.println("FAN OFF command broadcasted");
+  if (topicStr.startsWith("starswechase/sungai/control/")) {
+    String device = topicStr.substring(23); // Ambil bagian setelah "control/"
+    if (device == "lampu" || device == "kipas") {
+      String state = messageTemp;
+      mesh.sendBroadcast("{\"device\":\"" + device + "\",\"state\":\"" + state + "\"}");
+      Serial.println(device + " " + state + " command broadcasted");
     }
   }
 }
@@ -157,23 +143,19 @@ void sendAllSensorData() {
   float h = dht.readHumidity();
   float t = dht.readTemperature();
 
-  if (isnan(h) || isnan(t)) {
-    Serial.println("Gagal membaca dari sensor DHT");
-    h = -1.0;
-    t = -1.0;
-  }
-  if (lux < 0) {
-    Serial.println("Gagal membaca dari sensor BH1750");
-    lux = -1.0;
+  if (isnan(h) || isnan(t) || lux < 0) {
+    Serial.println("Gagal membaca dari salah satu sensor, melewatkan pengiriman.");
+    return; // Melewatkan pengiriman jika ada data tidak valid
   }
 
-  String msg = "{";
-  msg += "\"node\":\"sensor_control_node\",";
-  msg += "\"lux\":" + String(lux, 2) + ",";
-  msg += "\"temperature\":" + String(t, 1) + ",";
-  msg += "\"humidity\":" + String(h, 1);
-  msg += "}";
+  DynamicJsonDocument doc(128);
+  doc["node"] = "sensor_control_node";
+  doc["lux"] = lux;
+  doc["temperature"] = t;
+  doc["humidity"] = h;
 
+  String msg;
+  serializeJson(doc, msg);
   mesh.sendBroadcast(msg);
   Serial.println("Terkirim: " + msg);
 }
@@ -212,7 +194,8 @@ void setup_wifi() {
 void reconnect_mqtt() {
   while (!client.connected()) {
     Serial.print("Attempting MQTT connection...");
-    client.setInsecure(); // HANYA UNTUK PENGEMBANGAN, GANTI DENGAN SERTIFIKAT CA UNTUK PRODUKSI
+    // Tambahkan sertifikat CA untuk koneksi aman (ganti dengan file CA HiveMQ)
+    client.setBufferSize(1024); // Tingkatkan buffer untuk pesan besar
     if (client.connect(mqtt_client_id, mqtt_user, mqtt_password)) {
       Serial.println("MQTT Connected!");
       client.subscribe(mqtt_topic_subscribe_control);
@@ -281,11 +264,12 @@ void loop() {
     }
     client.loop();
 
-    // Opsional: Publikasi data Gateway (jika ada sensor di Gateway)
+    // Publikasi data dummy untuk menjaga koneksi MQTT aktif
     unsigned long currentMillis = millis();
     if (currentMillis - lastPublishMillis > publishInterval) {
       lastPublishMillis = currentMillis;
-      // Tambahkan logika publikasi data Gateway jika ada sensor
+      client.publish(mqtt_topic_publish_sensor, "{\"status\":\"keep-alive\"}");
+      Serial.println("Published keep-alive message to MQTT");
     }
   #endif
 }

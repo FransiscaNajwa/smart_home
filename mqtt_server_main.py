@@ -8,6 +8,11 @@ import time
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 import pandas as pd
+import logging
+
+# Konfigurasi logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Memuat variabel lingkungan dari file .env
 load_dotenv()
@@ -17,7 +22,7 @@ app = Flask(__name__)
 # Ambil kata sandi dari variabel lingkungan
 db_password = os.getenv("DB_PASSWORD")
 if not db_password:
-    print("Error: DB_PASSWORD tidak ditemukan di variabel lingkungan")
+    logger.error("Error: DB_PASSWORD tidak ditemukan di variabel lingkungan")
     raise ValueError("DB_PASSWORD tidak ditemukan di variabel lingkungan")
 
 # URI MongoDB Atlas
@@ -28,9 +33,9 @@ try:
     mongo_client = MongoClient(uri)
     db = mongo_client["smart_home"]
     collection = db["iot_sensor"]
-    print("Berhasil terhubung ke MongoDB Atlas")
+    logger.info("Berhasil terhubung ke MongoDB Atlas")
 except Exception as e:
-    print(f"Error saat menghubungkan ke MongoDB: {e}")
+    logger.error(f"Error saat menghubungkan ke MongoDB: {e}")
     raise
 
 # Konfigurasi MQTT
@@ -38,13 +43,29 @@ MQTT_BROKER = "6f820295b0364ee293a9a96c1f2457a6.s1.eu.hivemq.cloud"
 MQTT_PORT = 8883
 MQTT_USER = "hivemq.webclient.1748687406394"
 MQTT_PASSWORD = "K0p.D,9ErwiU!W51kS&n"
-MQTT_SENSOR_TOPIC = "starswechase/sungai/data"
+MQTT_SENSOR_TOPIC = "starswechase/sungai/data"  # Diselaraskan dengan Arduino
 MQTT_CONTROL_TOPIC = "starswechase/sungai/control"
 
 def on_connect(client, userdata, flags, rc):
-    print(f"Terhubung dengan kode hasil: {rc}")
-    client.subscribe(MQTT_SENSOR_TOPIC, qos=1)
-    client.subscribe(MQTT_CONTROL_TOPIC, qos=1)
+    if rc == 0:
+        logger.info(f"Terhubung ke MQTT Broker dengan kode hasil: {rc}")
+        client.subscribe(MQTT_SENSOR_TOPIC, qos=1)
+        client.subscribe(f"{MQTT_CONTROL_TOPIC}/#", qos=1)  # Subscribe dengan wildcard
+        logger.info(f"Subscribed ke {MQTT_SENSOR_TOPIC} dan {MQTT_CONTROL_TOPIC}/#")
+    else:
+        logger.warning(f"Koneksi gagal dengan kode: {rc}")
+
+def on_disconnect(client, userdata, rc):
+    logger.warning(f"Terputus dari MQTT Broker dengan kode: {rc}")
+    if rc != 0:
+        logger.info("Mencoba reconnect...")
+        while True:
+            try:
+                client.reconnect()
+                break
+            except Exception as e:
+                logger.error(f"Reconnect gagal: {e}")
+                time.sleep(5)
 
 def on_message(client, userdata, msg):
     try:
@@ -52,25 +73,27 @@ def on_message(client, userdata, msg):
         if msg.topic == MQTT_SENSOR_TOPIC:
             data["received_at"] = int(time.time() * 1000)
             collection.insert_one(data)
-            print(f"Data disimpan ke MongoDB: {data}")
-        elif msg.topic == MQTT_CONTROL_TOPIC:
-            print(f"Perintah kontrol diterima: {data}")
+            logger.info(f"Data disimpan ke MongoDB: {data}")
+        elif msg.topic.startswith(MQTT_CONTROL_TOPIC):
+            logger.info(f"Perintah kontrol diterima: {data}")
     except json.JSONDecodeError:
-        print(f"Error: Pesan MQTT bukan JSON valid: {msg.payload.decode()}")
+        logger.error(f"Error: Pesan MQTT bukan JSON valid: {msg.payload.decode()}")
     except Exception as e:
-        print(f"Error saat memproses pesan: {e}")
+        logger.error(f"Error saat memproses pesan: {e}")
 
 # Setup klien MQTT
 mqtt_client = mqtt.Client()
 mqtt_client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
-mqtt_client.tls_set()
+mqtt_client.tls_set(ca_certs=None, certfile=None, keyfile=None, cert_reqs=mqtt.ssl.CERT_REQUIRED, tls_version=mqtt.ssl.PROTOCOL_TLSv1_2, ciphers=None)
 mqtt_client.on_connect = on_connect
+mqtt_client.on_disconnect = on_disconnect
 mqtt_client.on_message = on_message
 try:
-    mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+    mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=30)
     mqtt_client.loop_start()
+    logger.info("MQTT Client dimulai dan berjalan")
 except Exception as e:
-    print(f"Error saat menghubungkan ke MQTT: {e}")
+    logger.error(f"Error saat menghubungkan ke MQTT: {e}")
     raise
 
 # Endpoint utama
@@ -129,7 +152,7 @@ def api():
                 total_cost = df['cost'].sum()
                 df['date'] = df['timestamp'].dt.date
                 daily = df.groupby('date').agg({'energy_kwh': 'sum', 'cost': 'sum'}).reset_index()
-                daily['date'] = daily['date'].astype(str)  # Pastikan format string untuk JSON
+                daily['date'] = daily['date'].astype(str)
                 daily_summary = daily.to_dict(orient='records')
 
                 return jsonify({
@@ -154,6 +177,7 @@ def api():
                 return jsonify({"error": "Aksi POST tidak valid"}), 400
 
     except Exception as e:
+        logger.error(f"Gagal memproses permintaan: {str(e)}")
         return jsonify({"error": f"Gagal memproses permintaan: {str(e)}"}), 500
 
 if __name__ == '__main__':
