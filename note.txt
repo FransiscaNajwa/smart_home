@@ -112,3 +112,13 @@ MQTT_STATUS_TOPIC = "starswechase/sungai/sensor/status"
 
 link:
 https://console.hivemq.cloud/
+
+Gateway Role: Perangkat ini (disarankan ESP32) bertugas:
+- Terhubung ke WiFi dan HiveMQ Cloud melalui MQTT.
+- Menerima data sensor dari jaringan mesh dan meneruskannya ke MQTT.
+- Menerima perintah kontrol dari MQTT dan meneruskannya ke jaringan mesh.
+
+Node Role: Perangkat ini (bisa ESP32 atau ESP8266) bertugas:
+- Mengumpulkan data sensor (lux, suhu, kelembapan).
+- Mengontrol aktuator (lampu/LED dan kipas/motor) berdasarkan perintah dari Gateway melalui mesh.
+- Mengirimkan data sensor ke Gateway melalui mesh.
