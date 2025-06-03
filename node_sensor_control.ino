@@ -1,71 +1,89 @@
-#include <ESP8266WiFi.h>
-#include <PainlessMesh.h>
-#include <ArduinoJson.h>
+#include <painlessMesh.h>   // Library untuk Mesh Networking
+#include <ArduinoJson.h>    // Library untuk JSON
+#include <DHT.h>            // Untuk sensor suhu/kelembaban
 
-// PainlessMesh Configuration
-#define MESH_PREFIX "smart_home_mesh"
-#define MESH_PASSWORD "mesh_password"
+// --- KONFIGURASI MESH ---
+#define MESH_PREFIX "SmartHomeMesh"
+#define MESH_PASSWORD "mesh_jarkom_123"
 #define MESH_PORT 5555
 
-// Pin untuk Motor (Aktuator ESP8266)
-#define MOTOR_PIN D1 // Ganti dengan pin yang sesuai untuk motor Anda
+painlessMesh mesh;
 
-PainlessMesh mesh;
+// --- DEFINISI PIN UNTUK NODE ---
+#define DHTPIN 4        // Pin untuk DHT11 (D2 pada NodeMCU)
+#define DHTTYPE DHT11
+#define MOTOR_PIN 15    // Pin untuk motor (kipas) (D8 pada NodeMCU)
 
-// Fungsi untuk mendapatkan epoch time dalam milidetik (opsional, jika diperlukan)
-unsigned long getEpochTime() {
-  return millis(); // Untuk ESP8266, gunakan millis() sebagai simulasi
-}
+// Objek sensor
+DHT dht(DHTPIN, DHTTYPE);
 
-void setup() {
-  Serial.begin(115200);
+// Variabel untuk Task dan interval
+Scheduler userScheduler;
+Task allSensorDataTask(10000, TASK_FOREVER, &sendAllSensorData); // 10 detik untuk Node
 
-  // Inisialisasi motor
-  pinMode(MOTOR_PIN, OUTPUT);
-  digitalWrite(MOTOR_PIN, LOW);
-
-  // Inisialisasi PainlessMesh
-  mesh.init(MESH_PREFIX, MESH_PASSWORD, MESH_PORT);
-  mesh.onReceive(&receivedCallback);
-}
-
+// --- MESH CALLBACKS ---
 void receivedCallback(uint32_t from, String &msg) {
-  Serial.println("Received control message from mesh: " + msg);
+  Serial.printf("Received from Mesh node %u: %s\n", from, msg.c_str());
 
-  // Parsing pesan kontrol
+  // Node memproses pesan kontrol dari Gateway
   DynamicJsonDocument doc(256);
-  deserializeJson(doc, msg);
-  if (doc["device"] == "ESP8266" && doc["actuator"] == "MOTOR") {
-    bool state = doc["state"];
-    digitalWrite(MOTOR_PIN, state ? HIGH : LOW);
-    Serial.println("Motor set to: " + String(state ? "ON" : "OFF"));
+  DeserializationError error = deserializeJson(doc, msg);
+  if (error) {
+    Serial.print("deserializeJson() failed: ");
+    Serial.println(error.c_str());
+    return;
+  }
+
+  String device = doc["device"];
+  String state = doc["state"];
+
+  if (device == "kipas") {
+    digitalWrite(MOTOR_PIN, state == "ON" ? HIGH : LOW);
+    Serial.println(state == "ON" ? "KIPAS DINYALAKAN" : "KIPAS DIMATIKAN");
   }
 }
 
+// --- FUNGSI NODE (Mengirim Data Sensor) ---
+void sendAllSensorData() {
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+
+  if (isnan(h) || isnan(t)) {
+    Serial.println("Gagal membaca dari sensor DHT, melewatkan pengiriman.");
+    return; // Melewatkan pengiriman jika ada data tidak valid
+  }
+
+  DynamicJsonDocument doc(128);
+  doc["device"] = "ESP8266"; // Menambahkan identifikasi device
+  doc["temperature"] = t;
+  doc["humidity"] = h;
+  doc["actuator_state"] = digitalRead(MOTOR_PIN) == HIGH; // Status kipas
+
+  String msg;
+  serializeJson(doc, msg);
+  mesh.sendBroadcast(msg);
+  Serial.println("Terkirim: " + msg);
+}
+
+// --- SETUP UTAMA ---
+void setup() {
+  Serial.begin(115200);
+
+  // Inisialisasi sensor untuk Node
+  dht.begin();
+  pinMode(MOTOR_PIN, OUTPUT);
+  digitalWrite(MOTOR_PIN, LOW);
+
+  // Inisialisasi Mesh untuk Node
+  mesh.setDebugMsgTypes(ERROR | STARTUP | CONNECTION);
+  mesh.init(MESH_PREFIX, MESH_PASSWORD, &userScheduler, MESH_PORT);
+  mesh.onReceive(&receivedCallback);
+  userScheduler.addTask(allSensorDataTask);
+  allSensorDataTask.enable();
+  sendAllSensorData(); // Kirim data pertama kali
+}
+
+// --- LOOP UTAMA ---
 void loop() {
   mesh.update();
-
-  // Baca data sensor (Suhu dan Kelembapan) - Untuk simulasi, gunakan random
-  float temperature = random(240, 270) / 10.0; // Ganti dengan pembacaan sensor (misalnya, DHT11)
-  float humidity = random(550, 650) / 10.0; // Ganti dengan pembacaan sensor
-  float voltage = 3.0 + (random(0, 4) / 10.0);
-
-  // Buat payload JSON
-  DynamicJsonDocument doc(256);
-  doc["device"] = "ESP8266";
-  doc["temperature"] = temperature;
-  doc["humidity"] = humidity;
-  doc["voltage"] = voltage;
-  doc["actuator"] = "MOTOR";
-  doc["actuator_state"] = digitalRead(MOTOR_PIN);
-  doc["timestamp"] = getEpochTime();
-
-  String payload;
-  serializeJson(doc, payload);
-
-  // Kirim ke ESP32 melalui mesh
-  mesh.sendBroadcast(payload);
-  Serial.println("Sent ESP8266 data to mesh: " + payload);
-
-  delay(5000); // Kirim data setiap 5 detik
 }
