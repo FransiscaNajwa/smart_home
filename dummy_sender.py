@@ -4,22 +4,18 @@ from pymongo import MongoClient
 import os
 from dotenv import load_dotenv
 
-# Memuat variabel lingkungan
 load_dotenv()
-
-# Ambil kata sandi dari variabel lingkungan
 db_password = os.getenv("DB_PASSWORD")
 if not db_password:
     raise ValueError("DB_PASSWORD tidak ditemukan di variabel lingkungan")
 
-# URI MongoDB Atlas
 uri = f"mongodb+srv://smarthome:{db_password}@cluster0.kaomhbl.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 
 def generate_dummy_data(num_records=10):
     try:
         mongo_client = MongoClient(uri)
-        db = mongo_client["smart_home"]
-        collection = db["iot_sensor"]
+        db = mongo_client["smarthomee"]
+        collection = db["iot_data"]
     except Exception as e:
         print(f"Error saat menghubungkan ke MongoDB: {e}")
         return False
@@ -28,30 +24,41 @@ def generate_dummy_data(num_records=10):
     dummy_data = []
 
     for i in range(num_records):
-        # Data untuk ESP32
-        esp32_data = {
-            "device": "ESP32",
-            "lux": round(random.uniform(400, 600), 2),
-            "voltage": round(random.uniform(3.0, 3.3), 2),
-            "actuator": "LED",
-            "actuator_state": random.choice([True, False]),
-            "timestamp": base_time - (i * 5000),
-            "received_at": base_time - (i * 5000) + 100
-        }
-        dummy_data.append(esp32_data)
+        timestamp = base_time - (i * 5000)
 
-        # Data untuk ESP8266
-        esp8266_data = {
-            "device": "ESP8266",
-            "temperature": round(random.uniform(24, 27), 2),
-            "humidity": round(random.uniform(55, 65), 2),
-            "voltage": round(random.uniform(3.0, 3.3), 2),
-            "actuator": "MOTOR",
-            "actuator_state": random.choice([True, False]),
-            "timestamp": base_time - (i * 5000),
-            "received_at": base_time - (i * 5000) + 100
+        # Kondisi lampu dan arus
+        kondisi_lampu = random.choice([True, False])
+        status_lampu = "ON" if kondisi_lampu else "OFF"
+        arus_lampu = round(random.uniform(0.01, 0.1), 3) if kondisi_lampu else 0.0
+        watt_lampu = round(5 * arus_lampu, 3)  # Tegangan 5V x arus
+
+        lampu_data = {
+            "device": "lampu",
+            "kondisi_lampu": kondisi_lampu,
+            "status": status_lampu,
+            "arus_lampu": arus_lampu,
+            "watt": watt_lampu,
+            "timestamp": timestamp,
+            "received_at": timestamp + 100
         }
-        dummy_data.append(esp8266_data)
+        dummy_data.append(lampu_data)
+
+        # Kondisi kipas dan arus
+        kondisi_kipas = random.choice([True, False])
+        status_kipas = "ON" if kondisi_kipas else "OFF"
+        arus_kipas = round(random.uniform(0.1, 0.5), 3) if kondisi_kipas else 0.0
+        watt_kipas = round(5 * arus_kipas, 3)
+
+        kipas_data = {
+            "device": "kipas",
+            "kondisi_kipas": kondisi_kipas,
+            "status": status_kipas,
+            "arus_kipas": arus_kipas,
+            "watt": watt_kipas,
+            "timestamp": timestamp,
+            "received_at": timestamp + 100
+        }
+        dummy_data.append(kipas_data)
 
     try:
         collection.insert_many(dummy_data)
