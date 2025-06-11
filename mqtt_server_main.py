@@ -1,161 +1,182 @@
 import os
+import ssl
 import json
-from datetime import datetime, timedelta
-
-from flask import Flask, jsonify, request
-from pymongo import MongoClient
-import paho.mqtt.client as mqtt
-from dotenv import load_dotenv
+import uuid
 import pandas as pd
+from datetime import datetime, timedelta
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from pymongo import MongoClient
+from dotenv import load_dotenv
+import paho.mqtt.client as mqtt
 
-load_dotenv()
-
-MQTT_BROKER = "68c1b8e40d134f6c898d4d31b1d85940.s1.eu.hivemq.cloud"
-MQTT_PORT = 8883
-MQTT_USER = "hivemq.webclient.1748991571679"
-MQTT_PASSWORD = "kM7%jF$Z&AX<rp2fN01w"  # Ganti dengan password HiveMQ
-MQTT_CLIENT_ID = "MicroPython_Sensor_001"
-MQTT_SENSOR_TOPIC = "smarthome_data"
-MQTT_CONTROL_TOPIC = "smarthome_control"
-
-db_password = os.getenv("DB_PASSWORD")
-mongo_uri = f"mongodb+srv://smarthome:{db_password}@cluster0.kaomhbl.mongodb.net/?retryWrites=true&w=majority"
-client = MongoClient(mongo_uri)
-db = client["smarthomee"]
-collection = db["iot_data"]
-
+# Inisialisasi Flask dan CORS
 app = Flask(__name__)
+CORS(app)
 
-def parse_timestamp(ts):
-    if isinstance(ts, (int, float)):
-        return datetime.utcfromtimestamp(ts / 1000)
-    try:
-        return datetime.fromisoformat(ts)
-    except Exception:
-        return None
+# ======== Konfigurasi MQTT HiveMQ Cloud ========
+MQTT_BROKER = "8acc9ffec16d43469734fd033e74dac1.s1.eu.hivemq.cloud"
+MQTT_PORT = 8883
+MQTT_USER = "hivemq.webclient.1749620447915"
+MQTT_PASSWORD = "#2Y4puH3%?qa:GSj1rAV"
+MQTT_CONTROL_TOPIC_KIPAS = "smarthome/command/kipas"
+MQTT_CONTROL_TOPIC_LAMPU = "smarthome/command/lampu"
 
-def validate_required_fields(data, required_fields):
-    missing = [field for field in required_fields if field not in data]
-    if missing:
-        print(f"❌ Data tidak memiliki kunci yang diperlukan: {missing}, data: {data}")
-        return False
-    return True
-
-def sanitize_data(data):
-    data.setdefault("kondisi_lampu", False if data.get("device") == "lampu" else None)
-    data.setdefault("arus_lampu", 0.0 if data.get("device") == "lampu" else None)
-    data.setdefault("kondisi_kipas", False if data.get("device") == "kipas" else None)
-    data.setdefault("arus_kipas", 0.0 if data.get("device") == "kipas" else None)
-
-    data["watt"] = round(5 * (data.get("arus_lampu", 0) + data.get("arus_kipas", 0)), 3)
-    return data
-
-# MQTT callbacks
-def on_connect(client, userdata, flags, rc):
-    if rc == 0:
-        print("Connected to MQTT Broker")
-        client.subscribe(MQTT_SENSOR_TOPIC)
-        client.subscribe(MQTT_CONTROL_TOPIC)
-    else:
-        print(f"Failed to connect, return code {rc}")
-
-def on_message(client, userdata, msg):
-    try:
-        payload = msg.payload.decode()
-        data = json.loads(payload)
-
-        required_fields = ["device", "timestamp", "received_at"]
-        if not validate_required_fields(data, required_fields):
-            return
-
-        data = sanitize_data(data)
-
-        if "status" not in data:
-            data["status"] = "ON" if data.get("kondisi_lampu") or data.get("kondisi_kipas") else "OFF"
-
-        collection.insert_one(data)
-        print(f"Data inserted: {data}")
-
-    except Exception as e:
-        print(f"Error processing MQTT message: {e}")
-
-mqtt_client = mqtt.Client(client_id=MQTT_CLIENT_ID)
-mqtt_client.tls_set()
+# Setup MQTT client
+mqtt_client = mqtt.Client()
 mqtt_client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
-mqtt_client.on_connect = on_connect
-mqtt_client.on_message = on_message
-mqtt_client.connect(MQTT_BROKER, MQTT_PORT)
+mqtt_client.tls_set(tls_version=ssl.PROTOCOL_TLS)
+mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
 mqtt_client.loop_start()
 
+# ======== Koneksi MongoDB ========
+load_dotenv()
+db_password = os.getenv("DB_PASSWORD")
+if not db_password:
+    raise ValueError("DB_PASSWORD tidak ditemukan di .env")
+
+uri = f"mongodb+srv://smarthome:{db_password}@cluster0.kaomhbl.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+mongo_client = MongoClient(uri)
+db = mongo_client["manajemen_listrik"]
+collection = db["kipas_dan_lampu"]
+
+# ======== ROUTE UTAMA ========
 @app.route('/control', methods=['GET', 'POST'])
 def control_device():
     if request.method == 'POST':
         data = request.json
         device = data.get("device")
         state = data.get("state")
-        if device and state:
-            topic = f"smart_home/control/{device}"
-            result = mqtt_client.publish(topic, state)
-            if result[0] == 0:
-                return jsonify({"status": "success", "device": device, "state": state})
-            else:
-                return jsonify({"status": "error", "message": "Failed to publish"}), 500
+
+        if device not in ["kipas", "lampu"]:
+            return jsonify({"status": "error", "message": "Device harus 'kipas' atau 'lampu'"}), 400
+        if state is None:
+            return jsonify({"status": "error", "message": "State tidak boleh kosong"}), 400
+
+        payload = {
+            "id": str(uuid.uuid4()),
+            "status": state.lower() == "on",
+            "timestamp": datetime.now().isoformat()
+        }
+
+        topic = MQTT_CONTROL_TOPIC_KIPAS if device == "kipas" else MQTT_CONTROL_TOPIC_LAMPU
+        result = mqtt_client.publish(topic, json.dumps(payload))
+
+        if result[0] == 0:
+            return jsonify({"status": "success", "device": device, "topic": topic, "payload": payload})
         else:
-            return jsonify({"status": "error", "message": "Invalid request"}), 400
+            return jsonify({"status": "error", "message": "MQTT publish failed"}), 500
 
     elif request.method == 'GET':
-        action = request.args.get("action")
-        if action == "data":
-            raw_data = list(collection.find().sort("timestamp", -1).limit(100))
-            for item in raw_data:
-                item["_id"] = str(item["_id"])
-                dt = parse_timestamp(item.get("timestamp"))
-                item["timestamp"] = dt.isoformat() if dt else None
-            return jsonify(raw_data)
+        action = request.args.get('action')
+        if action == 'data':
+            return get_sensor_data()
+        elif action == 'cost_summary':
+            return get_cost_summary()
+        else:
+            return jsonify({"status": "error", "message": "Action tidak dikenali"}), 400
 
-        elif action == "cost_summary":
-            period = request.args.get("period", "daily")
-            tariff = float(request.args.get("tariff", 1500))
-            now = datetime.utcnow()
-
-            if period == "weekly":
-                start = now - timedelta(days=7)
-            elif period == "monthly":
-                start = now - timedelta(days=30)
-            elif period == "yearly":
-                start = now - timedelta(days=365)
-            else:
-                start = now - timedelta(days=1)
-
-            raw_data = list(collection.find({"timestamp": {"$gte": int(start.timestamp() * 1000)}}))
-            if not raw_data:
-                return jsonify({"total_energy_kwh": 0, "total_cost": 0, "daily_summary": []})
-
-            for item in raw_data:
-                dt = parse_timestamp(item.get("timestamp"))
-                item["timestamp"] = dt if dt else None
-
-            df = pd.DataFrame(raw_data)
-            if df.empty or "timestamp" not in df.columns or df["timestamp"].isnull().all():
-                return jsonify({"total_energy_kwh": 0, "total_cost": 0, "daily_summary": []})
-
-            df = df.dropna(subset=["timestamp"])
-            df = df.sort_values("timestamp")
-            df['duration_s'] = df['timestamp'].diff().dt.total_seconds().fillna(0)
-
-            df['energy_kwh'] = (df['watt'] * df['duration_s'] / 3600) / 1000
-            total_energy = df['energy_kwh'].sum()
-            total_cost = total_energy * tariff
-
-            daily_summary = df.groupby(df['timestamp'].dt.date).agg({'energy_kwh': 'sum'}).reset_index()
-            daily_summary['timestamp'] = daily_summary['timestamp'].astype(str)  # Pastikan timestamp ada
-            return jsonify({
-                "total_energy_kwh": total_energy,
-                "total_cost": total_cost,
-                "daily_summary": daily_summary.to_dict('records')
+# ======== Fungsi untuk GET /control?action=data ========
+def get_sensor_data():
+    try:
+        raw = list(collection.find().sort("timestamp_kipas", -1).limit(100))
+        out = []
+        for r in raw:
+            out.append({
+                "device": "kipas",
+                "timestamp": r["timestamp_kipas"],
+                "status": "ON" if r["relay_kipas"] else "OFF",
+                "arus_kipas": r["watt_kipas"] / 5,
+                "watt": r["watt_kipas"]
             })
+            out.append({
+                "device": "lampu",
+                "timestamp": r["timestamp_lampu"],
+                "status": "ON" if r["relay_lampu"] else "OFF",
+                "arus_lampu": r["watt_lampu"] / 5,
+                "watt": r["watt_lampu"]
+            })
+        return jsonify(out)
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Gagal ambil data: {e}"}), 500
 
-    return jsonify({"status": "error", "message": "Invalid action"}), 400
+# ======== Fungsi untuk GET /control?action=cost_summary ========
+def get_cost_summary():
+    try:
+        period = request.args.get("period", "weekly")
+        tariff = float(request.args.get("tariff", 1500))
+        days_map = {"weekly": 7, "monthly": 30, "yearly": 365}
+        days = days_map.get(period, 1)
+        cutoff = datetime.utcnow() - timedelta(days=days)
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+        # Fetch data from MongoDB, ensuring both timestamps exist
+        raw = list(collection.find({
+            "$and": [
+                {"timestamp_kipas": {"$gte": cutoff, "$exists": True, "$ne": None}},
+                {"timestamp_lampu": {"$gte": cutoff, "$exists": True, "$ne": None}}
+            ]
+        }))
+        
+        if not raw:
+            return jsonify({
+                "status": "error",
+                "message": "No valid data found for the specified period"
+            }), 400
+
+        data = []
+        for r in raw:
+            # Process kipas data
+            if "timestamp_kipas" in r and r["timestamp_kipas"] and "watt_kipas" in r:
+                try:
+                    # Validate timestamp format
+                    pd.to_datetime(r["timestamp_kipas"])  # Test conversion
+                    data.append({
+                        "device": "kipas",
+                        "timestamp": r["timestamp_kipas"],
+                        "watt": r["watt_kipas"]
+                    })
+                except (ValueError, TypeError):
+                    continue  # Skip invalid timestamp
+            # Process lampu data
+            if "timestamp_lampu" in r and r["timestamp_lampu"] and "watt_lampu" in r:
+                try:
+                    pd.to_datetime(r["timestamp_lampu"])  # Test conversion
+                    data.append({
+                        "device": "lampu",
+                        "timestamp": r["timestamp_lampu"],
+                        "watt": r["watt_lampu"]
+                    })
+                except (ValueError, TypeError):
+                    continue  # Skip invalid timestamp
+
+        if not data:
+            return jsonify({
+                "status": "error",
+                "message": "No valid data with timestamps found for the specified period"
+            }), 400
+
+        df = pd.DataFrame(data)
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df = df.sort_values("timestamp")
+        df["duration"] = df.groupby("device")["timestamp"].diff().dt.total_seconds().fillna(0)
+        df["energy_kwh"] = (df["watt"] * df["duration"] / 3600) / 1000
+        df["date"] = df["timestamp"].dt.date
+
+        daily = df.groupby("date")["energy_kwh"].sum().reset_index()
+        daily["timestamp"] = pd.to_datetime(daily["date"])
+
+        return jsonify({
+            "status": "success",
+            "daily_summary": daily.to_dict(orient="records"),
+            "total_energy_kwh": float(df["energy_kwh"].sum()),
+            "total_cost": float(df["energy_kwh"].sum() * tariff)
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"Gagal hitung rekap: {str(e)}"
+        }), 500
+
+# ======== RUN SERVER ========
+if __name__ == '__main__':
+    app.run(debug=True)
