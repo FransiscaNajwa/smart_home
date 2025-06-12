@@ -1,261 +1,255 @@
-import streamlit as st
 import pandas as pd
-import requests
 import plotly.express as px
-from datetime import datetime, timedelta
+import streamlit as st
 
-# URL Flask
-FLASK_API_URL = "http://localhost:5000/api"
+import paho.mqtt.client as mqtt
+import time
+import os
 
-# Inisialisasi session state untuk tarif listrik
-if 'tariff' not in st.session_state:
-    st.session_state.tariff = 1500
+from pymongo import MongoClient
+from datetime import datetime
 
-# Fungsi untuk memeriksa data
-def check_data(data):
-    if not isinstance(data, list) or not data:
-        st.warning("😔 Data kosong atau format salah dari Flask")
-        return False
-    for item in data:
-        base = ['device', 'timestamp', 'status', 'watt']
-        if any(k not in item for k in base):
-            st.error(f"❌ Field dasar hilang: {item}")
-            return False
-        if item['device'] == 'lampu' and 'arus_lampu' not in item:
-            st.error(f"❌ Data lampu tidak punya 'arus_lampu': {item}")
-            return False
-        if item['device'] == 'kipas' and 'arus_kipas' not in item:
-            st.error(f"❌ Data kipas tidak punya 'arus_kipas': {item}")
-            return False
-    return True
+MQTT_BROKER = "8bda2df24fea4d2c9aadeb89eedd2738.s1.eu.hivemq.cloud"
+MQTT_PORT = 8883
+MQTT_USER = "hivemq.webclient.1749548766220"
+MQTT_PASSWORD = "1uBpWUE9<:jAq5>6d#bY"
+MQTT_CONTROL_TOPIC_RELAY_ON_OFF = "iot/perintah/relay_on_off"
+MQTT_CONTROL_TOPIC_RELAY_LAMPU = "iot/perintah/relay_lampu"
 
-# Fungsi untuk menghasilkan data dummy otomatis
-def init_dummy_data():
-    try:
-        from dummy_sender import generate_dummy_data
-        # Periksa jumlah data di MongoDB
-        response = requests.get(FLASK_API_URL, params={"action": "data", "limit": 1}, timeout=5)
-        response.raise_for_status()
-        data = response.json()
-        if not data:
-            st.write("ℹ️ Koleksi kosong, menghasilkan data dummy...")
-            if generate_dummy_data(20):  # Hasilkan 20 record dummy
-                st.success("✅ Berhasil menghasilkan 20 data dummy")
-            else:
-                st.error("❌ Gagal menghasilkan data dummy")
-    except ImportError:
-        st.error("❌ Modul dummy_sender tidak ditemukan")
-    except requests.exceptions.RequestException as e:
-        st.error(f"❌ Gagal memeriksa data di Flask: {e}")
-    except Exception as e:
-        st.error(f"❌ Error saat inisialisasi data dummy: {e}")
+TOGGLE_STATUS_FILE = ".streamlit_kipas_toggle_status.txt"
+TOGGLE_LED_FILE = ".streamlit_led_toggle_status.txt"
 
-# Inisialisasi data dummy saat aplikasi dimulai
-init_dummy_data()
+# === Koneksi MongoDB ===
+client = MongoClient("mongodb+srv://alfarrelmahardika:Z.iLkvVg7Ep6!uP@cluster0.lnbl9.mongodb.net/")
+collection = client["manajemen_listrik"]["kipas_dan_lampu"]
+data = list(collection.find().sort("timestamp", 1))
 
-# Aplikasi Streamlit
-st.title("🏠 Dashboard IoT Smart Home 🌐")
+def parse_time(s):
+    return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
 
-# Sidebar untuk pengaturan tarif
-st.sidebar.header("⚙️ Pengaturan Tarif Listrik")
-tariff = st.sidebar.number_input("💸 Tarif per kWh (Rp)", min_value=0, value=st.session_state.tariff, step=100)
-if st.sidebar.button("💾 Simpan Tarif"):
-    st.session_state.tariff = tariff
-    st.sidebar.success(f"✅ Tarif diatur ke Rp {tariff}/kWh")
+last_seen = {}
+energi_per_entry = []
 
-# Status Sensor Terkini (Visual dengan Kotak)
-st.subheader("📡 Status Sensor Terkini")
-try:
-    response = requests.get(FLASK_API_URL, params={"action": "data", "limit": 100}, timeout=5)
-    response.raise_for_status()
-    data = response.json()
-    if check_data(data):
-        df = pd.DataFrame(data)
-        st.write(f"ℹ️ Berhasil mengambil {len(df)} record dari MongoDB (dummy dan sensor)")
-        latest_data = df.sort_values('received_at', ascending=False).groupby('device').first().reset_index()
+# === Hitung energi ===
+for entry in data:
+    dev_id = entry["device_id"]
+    ts = parse_time(entry["timestamp"])
+    watt = entry["watt"]
 
-        # Layout dengan kolom untuk ESP32 dan ESP8266
-        col1, col2 = st.columns(2)
+    if dev_id in last_seen:
+        delta = (ts - last_seen[dev_id]["timestamp"]).total_seconds() / 60
+        energi = last_seen[dev_id]["watt"] * delta
+        energi_per_entry.append({
+            "timestamp": last_seen[dev_id]["timestamp"],
+            "device_id": dev_id,
+            "watt": last_seen[dev_id]["watt"],
+            "energi": energi
+        })
 
-        with col1:
-            for _, row in latest_data.iterrows():
-                if row['device'] == 'ESP32':
-                    with st.container():
-                        st.markdown(f"<div style='background-color: #e6ffe6; padding: 10px; border-radius: 5px;'>", unsafe_allow_html=True)
-                        st.markdown(f"💡 **Lampu**")
-                        lux = row.get('lux', 'N/A')
-                        if lux != 'N/A':
-                            st.markdown(f"Lux: {lux}")
-                        actuator_state = '🟢 ON' if row.get('actuator_state', False) else '🔴 OFF'
-                        st.markdown(f"Status: {actuator_state}")
-                        st.markdown("</div>", unsafe_allow_html=True)
+    last_seen[dev_id] = {"timestamp": ts, "watt": watt}
 
-        with col2:
-            for _, row in latest_data.iterrows():
-                if row['device'] == 'ESP8266':
-                    with st.container():
-                        st.markdown(f"<div style='background-color: #e6ffe6; padding: 10px; border-radius: 5px;'>", unsafe_allow_html=True)
-                        st.markdown(f"⚙️ **Kipas**")
-                        temp = row.get('temperature', 'N/A')
-                        if temp != 'N/A':
-                            st.markdown(f"Suhu: {temp} °C")
-                        hum = row.get('humidity', 'N/A')
-                        if hum != 'N/A':
-                            st.markdown(f"Kelembapan: {hum} %")
-                        actuator_state = '🟢 ON' if row.get('actuator_state', False) else '🔴 OFF'
-                        st.markdown(f"Status: {actuator_state}")
-                        st.markdown("</div>", unsafe_allow_html=True)
+# === Konversi DataFrame ===
+df = pd.DataFrame(energi_per_entry)
+if df.empty:
+    st.warning("Data tidak tersedia.")
+    st.stop()
+
+df["tanggal"] = df["timestamp"].dt.date
+df["bulan"] = df["timestamp"].dt.to_period("M")
+df["perangkat"] = df["device_id"].map({1: "lampu", 2: "kipas"})
+tarif_per_kwh = 1444
+df["tarif"] = (df["energi"] / 1000) * tarif_per_kwh
+
+# === CSS Card UI ===
+st.markdown("""
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+<style>
+.metric-card {
+    padding: 1rem;
+    border-radius: 0.5rem;
+    color: white;
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    height: 100px;
+    box-sizing: border-box;
+    margin-bottom: 1rem;
+}
+.bg-blue { background-color: #3b82f6; }
+.bg-green { background-color: #10b981; }
+.bg-yellow { background-color: #f59e0b; }
+.bg-red { background-color: #ef4444; }
+.metric-title { font-size: 0.875rem; font-weight: 600; }
+.metric-value { font-size: 1.25rem; font-weight: 700; }
+.metric-icon { font-size: 1.5rem; }
+.text-content { display: flex; flex-direction: column; }
+</style>
+""", unsafe_allow_html=True)
+
+# === Filter data hari & bulan ===
+last_date = df["tanggal"].max()
+bulan_ini = df["bulan"].max()
+
+df_today = df[df["tanggal"] == last_date].copy()
+df_bulan = df[df["bulan"] == bulan_ini].copy()
+
+def simpan_status_kipas(status: str):
+    with open(TOGGLE_STATUS_FILE, "w") as f:
+        f.write(status)
+
+def muat_status_kipas():
+    if os.path.exists(TOGGLE_STATUS_FILE):
+        with open(TOGGLE_STATUS_FILE, "r") as f:
+            return f.read().strip()
     else:
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown(f"<div style='background-color: #e6ffe6; padding: 10px; border-radius: 5px;'>", unsafe_allow_html=True)
-            st.markdown(f"💡 **Lampu**")
-            st.markdown("Status: UNKNOWN")
-            st.markdown("</div>", unsafe_allow_html=True)
-        with col2:
-            st.markdown(f"<div style='background-color: #e6ffe6; padding: 10px; border-radius: 5px;'>", unsafe_allow_html=True)
-            st.markdown(f"⚙️ **Kipas**")
-            st.markdown("Status: UNKNOWN")
-            st.markdown("</div>", unsafe_allow_html=True)
-except requests.exceptions.RequestException as e:
-    st.error(f"❌ Gagal menghubungi Flask: {e}")
-    data = []
-except Exception as e:
-    st.error(f"❌ Error saat memproses data: {e}")
-    data = []
+        return "1"
 
-# Total Biaya
-st.subheader("💰 Total Biaya")
-if data and check_data(data):
-    try:
-        df = pd.DataFrame(data)
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', errors='coerce')
-        df = df.dropna(subset=['timestamp'])
-        df = df.sort_values('timestamp')  # Urutkan berdasarkan timestamp
-        df['power_w'] = 0
-        df.loc[(df['device'] == 'ESP32') & (df['actuator_state'] == True), 'power_w'] = 5
-        df.loc[(df['device'] == 'ESP8266') & (df['actuator_state'] == True), 'power_w'] = 10
-        df['duration_h'] = df['timestamp'].diff().dt.total_seconds() / 3600
-        df['duration_h'].fillna(0, inplace=True)
-        df['duration_h'] = df['duration_h'].clip(lower=0)  # Pastikan tidak ada durasi negatif
-        df['energy_kwh'] = df['power_w'] * df['duration_h'] / 1000
-        df['cost'] = df['energy_kwh'] * st.session_state.tariff
-        total_cost = df['cost'].sum()
-        if total_cost < 0:
-            total_cost = 0  # Pastikan total biaya tidak negatif
-        st.write(f"💸 **Total Biaya Hingga Saat Ini**: Rp {total_cost:,.2f}")
-    except Exception as e:
-        st.error(f"❌ Error saat menghitung total biaya: {e}")
-else:
-    st.write("Tidak ada data untuk menghitung biaya.")
+def simpan_status_led(status: str):
+    with open(TOGGLE_LED_FILE, "w") as f:
+        f.write(status)
 
-# Rekap dan Estimasi Konsumsi
-st.subheader("📊 Rekap & Estimasi Konsumsi ⚡")
-period = st.selectbox("📅 Pilih Periode", ["Mingguan", "Bulanan", "Tahunan"])
-try:
-    period_map = {"Mingguan": "weekly", "Bulanan": "monthly", "Tahunan": "yearly"}
-    days_map = {"Mingguan": 7, "Bulanan": 30, "Tahunan": 365}
-
-    # Ambil data rekap dari Flask
-    response = requests.get(FLASK_API_URL, params={"action": "cost_summary", "period": period_map[period], "tariff": st.session_state.tariff}, timeout=5)
-    response.raise_for_status()
-    summary = response.json()
-    st.write(f"⚡ **Total Energi ({period})**: {summary.get('total_energy_kwh', 0):.3f} kWh")
-    st.write(f"💸 **Total Biaya ({period})**: Rp {summary.get('total_cost', 0):,.2f}")
-
-    # Grafik Konsumsi
-    daily_df = pd.DataFrame(summary.get('daily_summary', []))
-    if not daily_df.empty:
-        daily_df['date'] = pd.to_datetime(daily_df['date'])
-        fig = px.line(daily_df, x='date', y=['energy_kwh', 'cost'], title=f"📈 Rekap Konsumsi {period}",
-                      labels={'value': 'Nilai', 'date': 'Tanggal', 'variable': 'Metrik'})
-        st.plotly_chart(fig)
+def muat_status_led():
+    if os.path.exists(TOGGLE_LED_FILE):
+        with open(TOGGLE_LED_FILE, "r") as f:
+            return f.read().strip()
     else:
-        st.warning("😔 Tidak ada data untuk grafik konsumsi")
+        return "1"
 
-    # Estimasi berdasarkan periode yang dipilih
-    if data and check_data(data):
-        df = pd.DataFrame(data)
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', errors='coerce')
-        df = df.dropna(subset=['timestamp'])
-        df = df.sort_values('timestamp')
-        df['power_w'] = 0
-        df.loc[(df['device'] == 'ESP32') & (df['actuator_state'] == True), 'power_w'] = 5
-        df.loc[(df['device'] == 'ESP8266') & (df['actuator_state'] == True), 'power_w'] = 10
-        df['duration_h'] = df['timestamp'].diff().dt.total_seconds() / 3600
-        df['duration_h'].fillna(0, inplace=True)
-        df['duration_h'] = df['duration_h'].clip(lower=0)
-        df['energy_kwh'] = df['power_w'] * df['duration_h'] / 1000
-        total_energy = df['energy_kwh'].sum()
-        if total_energy < 0:
-            total_energy = 0
+def publish_mqtt_command(topic: str, message: str):
+    client = mqtt.Client()
+    client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
+    client.tls_set()
+    client.connect(MQTT_BROKER, MQTT_PORT)
+    client.loop_start()
+    client.publish(topic, message)
+    time.sleep(1)
+    client.loop_stop()
+    client.disconnect()
 
-        days = (df['timestamp'].max() - df['timestamp'].min()).total_seconds() / (3600 * 24)
-        if days <= 0:
-            days = 1
-        daily_avg_energy = total_energy / days if total_energy > 0 else 0
-        if daily_avg_energy < 0:
-            daily_avg_energy = 0
 
-        # Estimasi untuk periode yang dipilih
-        estimated_days = days_map[period]
-        estimated_energy = daily_avg_energy * estimated_days
-        estimated_cost = estimated_energy * st.session_state.tariff
-        if estimated_cost < 0:
-            estimated_cost = 0
-        st.write(f"🔮 **Estimasi Energi ({period})**: {estimated_energy:.3f} kWh")
-        st.write(f"💰 **Estimasi Biaya ({period})**: Rp {estimated_cost:,.2f}")
-    else:
-        st.write("😔 Tidak ada data untuk estimasi")
-except requests.exceptions.RequestException as e:
-    st.error(f"❌ Gagal mengambil rekap: {e}")
-except Exception as e:
-    st.error(f"❌ Error saat memproses rekap: {e}")
+# === Dropdown visualisasi ===
+st.title("📊 Konsumsi Energi & Tarif Listrik")
 
-# Kontrol Manual
-st.subheader("🎮 Kontrol Manual")
+# === Card Container: 2 Kolom x 2 Baris ===
 col1, col2 = st.columns(2)
 with col1:
-    st.write("💡 ESP32 - Kontrol LED")
-    if st.button("🟢 Nyalakan LED"):
-        payload = {"device": "ESP32", "actuator": "LED", "state": True}
-        try:
-            response = requests.post(FLASK_API_URL, params={"action": "control"}, json=payload, timeout=5)
-            response.raise_for_status()
-            st.success("✅ Perintah Nyalakan LED dikirim")
-        except requests.exceptions.RequestException as e:
-            st.error(f"❌ Gagal mengirim perintah: {e}")
-        except Exception as e:
-            st.error(f"❌ Error: {e}")
-    if st.button("🔴 Matikan LED"):
-        payload = {"device": "ESP32", "actuator": "LED", "state": False}
-        try:
-            response = requests.post(FLASK_API_URL, params={"action": "control"}, json=payload, timeout=5)
-            response.raise_for_status()
-            st.success("✅ Perintah Matikan LED dikirim")
-        except requests.exceptions.RequestException as e:
-            st.error(f"❌ Gagal mengirim perintah: {e}")
-        except Exception as e:
-            st.error(f"❌ Error: {e}")
+    st.markdown(f"""
+    <div class="metric-card bg-blue">
+        <i class="fas fa-money-bill-wave metric-icon"></i>
+        <div class="text-content">
+            <div class="metric-title">Total Tarif Hari Ini</div>
+            <div class="metric-value">Rp {df_today['tarif'].sum():,.2f}</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 with col2:
-    st.write("⚙️ ESP8266 - Kontrol Motor")
-    if st.button("🟢 Nyalakan Motor"):
-        payload = {"device": "ESP8266", "actuator": "MOTOR", "state": True}
-        try:
-            response = requests.post(FLASK_API_URL, params={"action": "control"}, json=payload, timeout=5)
-            response.raise_for_status()
-            st.success("✅ Perintah Nyalakan Motor dikirim")
-        except requests.exceptions.RequestException as e:
-            st.error(f"❌ Gagal mengirim perintah: {e}")
-        except Exception as e:
-            st.error(f"❌ Error: {e}")
-    if st.button("🔴 Matikan Motor"):
-        payload = {"device": "ESP8266", "actuator": "MOTOR", "state": False}
-        try:
-            response = requests.post(FLASK_API_URL, params={"action": "control"}, json=payload, timeout=5)
-            response.raise_for_status()
-            st.success("✅ Perintah Matikan Motor dikirim")
-        except requests.exceptions.RequestException as e:
-            st.error(f"❌ Gagal mengirim perintah: {e}")
-        except Exception as e:
-            st.error(f"❌ Error: {e}")
+    st.markdown(f"""
+    <div class="metric-card bg-green">
+        <i class="fas fa-coins metric-icon"></i>
+        <div class="text-content">
+            <div class="metric-title">Total Tarif Bulan Ini</div>
+            <div class="metric-value">Rp {df_bulan['tarif'].sum():,.2f}</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+col3, col4 = st.columns(2)
+with col3:
+    energi_hari_kwh = round(df_today["energi"].sum() / 1000, 5)
+    st.markdown(f"""
+    <div class="metric-card bg-yellow">
+        <i class="fas fa-battery-half metric-icon"></i>
+        <div class="text-content">
+            <div class="metric-title">Total Energi Hari Ini</div>
+            <div class="metric-value">{energi_hari_kwh} kWh</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+with col4:
+    energi_bulan_kwh = round(df_bulan["energi"].sum() / 1000, 5)
+    st.markdown(f"""
+    <div class="metric-card bg-red">
+        <i class="fas fa-battery-full metric-icon"></i>
+        <div class="text-content">
+            <div class="metric-title">Total Energi Bulan Ini</div>
+            <div class="metric-value">{energi_bulan_kwh} kWh</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+st.markdown("### 🔧 Kontrol Perangkat")
+
+# Status saat ini
+status_kipas = muat_status_kipas()
+status_lampu = muat_status_led()
+kipas_nyala = status_kipas == "0"
+lampu_nyala = status_lampu == "0"
+
+col_toggle_kipas, col_toggle_lampu, col_refresh = st.columns([2, 2, 1])
+
+with col_toggle_kipas:
+    toggle_kipas = st.toggle("Kipas", value=kipas_nyala)
+
+with col_toggle_lampu:
+    toggle_lampu = st.toggle("Lampu", value=lampu_nyala)
+
+with col_refresh:
+    if st.button("🔄 Refresh"):
+        st.rerun()
+
+# === Tangani aksi toggle Kipas ===
+if toggle_kipas and status_kipas == "1":
+    publish_mqtt_command(MQTT_CONTROL_TOPIC_RELAY_ON_OFF, "0")  # Hidupkan kipas
+    simpan_status_kipas("0")
+    st.success("✅ Kipas dihidupkan.")
+elif not toggle_kipas and status_kipas == "0":
+    publish_mqtt_command(MQTT_CONTROL_TOPIC_RELAY_ON_OFF, "1")  # Matikan kipas
+    simpan_status_kipas("1")
+    st.warning("⛔ Kipas dimatikan.")
+
+# === Tangani aksi toggle Lampu ===
+if toggle_lampu and status_lampu == "1":
+    publish_mqtt_command(MQTT_CONTROL_TOPIC_RELAY_LAMPU, "0")  # Hidupkan lampu
+    simpan_status_led("0")
+    st.success("💡 Lampu dinyalakan.")
+elif not toggle_lampu and status_lampu == "0":
+    publish_mqtt_command(MQTT_CONTROL_TOPIC_RELAY_LAMPU, "1")  # Matikan lampu
+    simpan_status_led("1")
+    st.warning("💡 Lampu dimatikan.")
+
+
+
+pilihan = st.selectbox("Pilih rentang waktu:", ["Hari Ini", "Bulan Ini"])
+
+# === Visualisasi Energi ===
+if pilihan == "Hari Ini":
+    df_plot = df_today
+    formatted_date = last_date.strftime("%A, %d %B %Y")
+    title = f"Energi Konsumsi - {formatted_date}"
+else:
+    df_plot = df_bulan
+    formatted_month = bulan_ini.strftime("%B %Y")
+    title = f"Energi Konsumsi Bulan Ini - {formatted_month}"
+
+fig = px.line(
+    df_plot,
+    x="timestamp",
+    y="energi",
+    color="perangkat",
+    title=title,
+    labels={"timestamp": "Waktu", "energi": "Energi (Wh)", "perangkat": "Perangkat"},
+    markers=True
+)
+fig.update_traces(line=dict(width=2))
+st.plotly_chart(fig, use_container_width=True)
+
+# === Tabel di bawah grafik ===
+st.subheader("📄 Data Konsumsi Energi")
+
+tabel_data = df_plot.copy()
+tabel_data["perangkat"] = tabel_data["device_id"].map({1: "lampu", 2: "kipas"})
+tabel_data = tabel_data[["timestamp", "perangkat", "watt", "energi", "tarif"]].copy()
+tabel_data["tarif"] = tabel_data["tarif"].round(2)
+tabel_data["energi"] = tabel_data["energi"].round(5)
+tabel_data = tabel_data.sort_values(by="timestamp", ascending=False).reset_index(drop=True)
+st.dataframe(tabel_data, use_container_width=True)
