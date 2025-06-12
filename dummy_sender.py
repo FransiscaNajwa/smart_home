@@ -25,7 +25,7 @@ def generate_dummy_data(days=30, records_per_day=1440):  # 1440 = 24 hours * 60 
     print("🧹 Koleksi dibersihkan sebelum menyisipkan data baru")
 
     dummy_data = []
-    start_date = datetime(2025, 6, 11, 23, 59, 0)  # End at June 11, 2025, 23:59
+    start_date = datetime(2025, 6, 10, 17,59, 0)  # End at June 11, 2025, 23:59
     total_records = days * records_per_day  # 30 * 1440 = 43,200
 
     # Track device state and duration to avoid rapid toggling
